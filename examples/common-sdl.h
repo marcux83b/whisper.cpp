@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include <mutex>
+#include <string>
 
 //
 // SDL Audio capture
@@ -18,6 +19,8 @@ public:
     ~audio_async();
 
     bool init(int capture_id, int sample_rate);
+    // start capturing audio from stdin (no SDL device)
+    bool init_stdin(int sample_rate, const std::string & format);
 
     // start capturing audio via the provided SDL callback
     // keep last len_ms seconds of audio in a circular buffer
@@ -31,6 +34,12 @@ public:
     // get audio data from the circular buffer
     void get(int ms, std::vector<float> & audio);
 
+    // Read more audio from stdin into the circular buffer (if stdin mode)
+    bool read_from_stdin();
+
+    // Accessor for EOF state in stdin mode
+    bool is_stdin_eof() const { return m_input_mode == MODE_STDIN && m_stdin_eof; }
+
 private:
     SDL_AudioDeviceID m_dev_id_in = 0;
 
@@ -39,6 +48,15 @@ private:
 
     std::atomic_bool m_running;
     std::mutex       m_mutex;
+
+    enum InputMode {
+        MODE_MICROPHONE,
+        MODE_STDIN,
+    };
+
+    InputMode m_input_mode = MODE_MICROPHONE;
+    bool      m_stdin_eof  = false;
+    std::string m_stdin_format = "f32le"; // "f32le" or "s16le"
 
     std::vector<float> m_audio;
     size_t             m_audio_pos = 0;

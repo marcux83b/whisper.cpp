@@ -123,3 +123,16 @@ endif()
 if (WHISPER_SDL2)
     add_subdirectory(wchess)
 endif (WHISPER_SDL2)
+
+# Ensure whisper-stream target is built by default with examples
+# Match the style of other top-level example targets (whisper-cli, whisper-server)
+# If the target already exists from examples/stream, this block is a no-op.
+if (WHISPER_SDL2)
+    if (NOT TARGET whisper-stream)
+        add_executable(whisper-stream stream/stream.cpp)
+        include(DefaultTargetOptions)
+        target_link_libraries(whisper-stream PRIVATE common common-sdl whisper ${WHISPER_EXTRA_LIBS} ${CMAKE_THREAD_LIBS_INIT})
+        set_target_properties(whisper-stream PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        install(TARGETS whisper-stream RUNTIME)
+    endif()
+endif()

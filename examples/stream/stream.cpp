@@ -37,6 +37,8 @@ struct whisper_params {
     bool save_audio    = false; // save audio to wav file
     bool use_gpu       = true;
     bool flash_attn    = true;
+    bool use_stdin     = false;           // use stdin instead of microphone
+    std::string stdin_format = "f32le";   // stdin audio format: f32le or s16le
 
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
@@ -75,6 +77,8 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
+        else if (                  arg == "--stdin")          { params.use_stdin     = true; }
+        else if (                  arg == "--stdin-format")   { params.stdin_format  = argv[++i]; }
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -114,6 +118,8 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -fa,      --flash-attn    [%-7s] enable flash attention during inference\n",        params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -nfa,     --no-flash-attn [%-7s] disable flash attention during inference\n",       params.flash_attn ? "false" : "true");
+    fprintf(stderr, "            --stdin         [%-7s] read PCM audio from stdin (no device)\n",           params.use_stdin ? "true" : "false");
+    fprintf(stderr, "            --stdin-format  [%-7s] stdin PCM format: f32le or s16le\n",           params.stdin_format.c_str());
     fprintf(stderr, "\n");
 }
 
@@ -145,9 +151,21 @@ int main(int argc, char ** argv) {
     // init audio
 
     audio_async audio(params.length_ms);
-    if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
-        fprintf(stderr, "%s: audio.init() failed!\n", __func__);
-        return 1;
+    if (params.use_stdin) {
+        // basic validation
+        if (params.stdin_format != "f32le" && params.stdin_format != "s16le") {
+            fprintf(stderr, "%s: invalid --stdin-format '%s' (expected 'f32le' or 's16le')\n", __func__, params.stdin_format.c_str());
+            return 1;
+        }
+        if (!audio.init_stdin(WHISPER_SAMPLE_RATE, params.stdin_format)) {
+            fprintf(stderr, "%s: audio.init_stdin() failed!\n", __func__);
+            return 1;
+        }
+    } else {
+        if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
+            fprintf(stderr, "%s: audio.init() failed!\n", __func__);
+            return 1;
+        }
     }
 
     audio.resume();
@@ -230,7 +248,11 @@ int main(int argc, char ** argv) {
 
         wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
     }
-    printf("[Start speaking]\n");
+    if (params.use_stdin) {
+        printf("[Reading audio from stdin. Expected %s PCM at %d Hz, mono]\n", params.stdin_format.c_str(), WHISPER_SAMPLE_RATE);
+    } else {
+        printf("[Start speaking]\n");
+    }
     fflush(stdout);
 
     auto t_last  = std::chrono::high_resolution_clock::now();
@@ -238,6 +260,11 @@ int main(int argc, char ** argv) {
 
     // main audio loop
     while (is_running) {
+        // If reading from stdin, exit cleanly on EOF
+        if (params.use_stdin && audio.is_stdin_eof()) {
+            fprintf(stderr, "End of stdin reached, exiting cleanly.\n");
+            break;
+        }
         if (params.save_audio) {
             wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
         }
@@ -255,6 +282,11 @@ int main(int argc, char ** argv) {
                 // handle Ctrl + C
                 is_running = sdl_poll_events();
                 if (!is_running) {
+                    break;
+                }
+                if (params.use_stdin && audio.is_stdin_eof()) {
+                    // break out of inner loop and outer loop will catch EOF too
+                    is_running = false;
                     break;
                 }
                 audio.get(params.step_ms, pcmf32_new);
@@ -423,6 +455,11 @@ int main(int argc, char ** argv) {
                         }
                     }
                 }
+            }
+
+            // In VAD mode, avoid reprocessing the same audio on the next cycle
+            if (use_vad) {
+                audio.clear();
             }
             fflush(stdout);
         }

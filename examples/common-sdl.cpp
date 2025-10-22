@@ -1,6 +1,13 @@
 #include "common-sdl.h"
 
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 audio_async::audio_async(int len_ms) {
     m_len_ms = len_ms;
@@ -78,7 +85,31 @@ bool audio_async::init(int capture_id, int sample_rate) {
     return true;
 }
 
+bool audio_async::init_stdin(int sample_rate, const std::string & format) {
+    m_sample_rate  = sample_rate;
+    m_audio.resize((m_sample_rate*m_len_ms)/1000);
+    m_input_mode   = MODE_STDIN;
+    m_stdin_eof    = false;
+    m_stdin_format = format;
+
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
+    fprintf(stderr, "%s: initialized stdin audio capture, sample rate = %d, format = %s\n", __func__, m_sample_rate, m_stdin_format.c_str());
+    return true;
+}
+
 bool audio_async::resume() {
+    if (m_input_mode == MODE_STDIN) {
+        if (m_running) {
+            fprintf(stderr, "%s: already running!\n", __func__);
+            return false;
+        }
+        m_running = true;
+        return true;
+    }
+
     if (!m_dev_id_in) {
         fprintf(stderr, "%s: no audio device to resume!\n", __func__);
         return false;
@@ -97,6 +128,15 @@ bool audio_async::resume() {
 }
 
 bool audio_async::pause() {
+    if (m_input_mode == MODE_STDIN) {
+        if (!m_running) {
+            fprintf(stderr, "%s: already paused!\n", __func__);
+            return false;
+        }
+        m_running = false;
+        return true;
+    }
+
     if (!m_dev_id_in) {
         fprintf(stderr, "%s: no audio device to pause!\n", __func__);
         return false;
@@ -115,6 +155,13 @@ bool audio_async::pause() {
 }
 
 bool audio_async::clear() {
+    if (m_input_mode == MODE_STDIN) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_audio_pos = 0;
+        m_audio_len = 0;
+        return true;
+    }
+
     if (!m_dev_id_in) {
         fprintf(stderr, "%s: no audio device to clear!\n", __func__);
         return false;
@@ -168,7 +215,12 @@ void audio_async::callback(uint8_t * stream, int len) {
 }
 
 void audio_async::get(int ms, std::vector<float> & result) {
-    if (!m_dev_id_in) {
+    if (m_input_mode == MODE_STDIN && m_running) {
+        // For stdin mode, try to read more data before returning
+        read_from_stdin();
+    }
+
+    if (m_input_mode != MODE_STDIN && !m_dev_id_in) {
         fprintf(stderr, "%s: no audio device to get audio from!\n", __func__);
         return;
     }
@@ -220,6 +272,67 @@ bool sdl_poll_events() {
                 }
             default:
                 break;
+        }
+    }
+
+    return true;
+}
+
+bool audio_async::read_from_stdin() {
+    if (m_stdin_eof) {
+        return false;
+    }
+
+    // Number of samples to read (1/10th of a second of audio)
+    const size_t n_samples_to_read = std::max(1, m_sample_rate / 10);
+
+    size_t n_read = 0;
+    std::vector<float> buf;
+    buf.resize(n_samples_to_read);
+
+    if (m_stdin_format == "s16le") {
+        std::vector<int16_t> tmp(n_samples_to_read);
+        n_read = fread(tmp.data(), sizeof(int16_t), n_samples_to_read, stdin);
+        if (n_read == 0) {
+            if (feof(stdin)) {
+                fprintf(stderr, "%s: reached end of stdin (s16le)\n", __func__);
+                m_stdin_eof = true;
+                return false;
+            }
+            return true; // no data yet
+        }
+        for (size_t i = 0; i < n_read; ++i) {
+            buf[i] = tmp[i] / 32768.0f;
+        }
+    } else { // f32le (default)
+        n_read = fread(buf.data(), sizeof(float), n_samples_to_read, stdin);
+        if (n_read == 0) {
+            if (feof(stdin)) {
+                fprintf(stderr, "%s: reached end of stdin (f32le)\n", __func__);
+                m_stdin_eof = true;
+                return false;
+            }
+            return true; // no data yet
+        }
+    }
+
+    // Store the data in the circular buffer
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        const size_t cap = m_audio.size();
+        if (cap == 0) return false;
+
+        size_t remaining = n_read;
+        size_t offset    = 0;
+        while (remaining > 0) {
+            const size_t to_end = cap - m_audio_pos;
+            const size_t n0 = std::min(remaining, to_end);
+            memcpy(&m_audio[m_audio_pos], buf.data() + offset, n0 * sizeof(float));
+            m_audio_pos = (m_audio_pos + n0) % cap;
+            m_audio_len = std::min(m_audio_len + n0, cap);
+            remaining -= n0;
+            offset    += n0;
         }
     }
 
