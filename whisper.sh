@@ -29,14 +29,14 @@ fi
 
 # === PIPELINE (v68c with RNNoise tuned mix & sync buffers) ===
 ffmpeg -hide_banner -nostats -loglevel warning \
-  -f pulse -thread_queue_size 1024 -i "$SPEAKER_SRC" \
   -f pulse -thread_queue_size 1024 -i "$MIC_SRC" \
-  -filter_complex "[1:a]aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000, \
-                      arnndn=m=$RNN:mix=0.90,highpass=f=80,lowpass=f=3400[mic]; \
-                   [0:a]aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000[speaker]; \
-                   [mic][speaker]amix=inputs=2:duration=shortest:dropout_transition=2, \
-                      highpass=f=120,lowpass=f=3500,compand=attacks=0.2:decays=0.4:points=-90/-900|-70/-70|-40/-20|0/0, \
-                      volume=1.9,aresample=resampler=soxr:async=1:first_pts=0,asetpts=N/SR/TB" \
+  -filter_complex "aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000, \
+                   arnndn=m=$RNN:mix=0.90,highpass=f=80,lowpass=f=3400, \
+                   compand=attacks=0.2:decays=0.4:points=-90/-900|-70/-70|-40/-20|0/0, \
+                   volume=1.9,aresample=resampler=soxr:async=1:first_pts=0,asetpts=N/SR/TB" \
   -ac 1 -ar 16000 -f f32le - \
-| ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" \
-| tee -a whisper_output.txt
+| ./build/bin/whisper-stream \
+     -m ./models/ggml-large-v3.bin \
+     --stdin --stdin-format f32le \
+     --eos-config ./eos_defaults.conf \
+     --debug-eos
