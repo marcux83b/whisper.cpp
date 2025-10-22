@@ -109,6 +109,34 @@ cat mic_test.raw | ./build/bin/whisper-stream \
   | tee -a whisper_output.txt
 ```
 
+## Streaming Buffering (mbuffer + sox)
+
+For robust real‑time use, insert buffering between `ffmpeg` and `whisper-stream` to smooth bursts
+and prevent underruns. The helper script `whisper.sh` demonstrates a practical setup using `sox`
+and `mbuffer`.
+
+- Requirements: `ffmpeg`, `sox`, and `mbuffer` must be installed.
+  - Debian/Ubuntu: `sudo apt-get install mbuffer`
+  - Fedora: `sudo dnf install mbuffer`
+  - macOS (Homebrew): `brew install mbuffer`
+
+- Environment knobs (override as needed when running `whisper.sh`):
+  - `BUFFER_SEC` (default `1.0`): seconds of end padding via sox.
+  - `MBUFFER_MEM` (default `2G`): target memory for mbuffer (e.g., `5G`).
+  - `MBUFFER_BLOCK` (default `64k`): mbuffer block size.
+  - `MONITOR=1`: insert `pv -rab` to monitor throughput (debug only).
+  - `FFMPEG_DEBUG=1`: enable ffmpeg verbose logs and timestamp debug.
+
+Examples
+
+```bash
+# Run with defaults (output required)
+./whisper.sh -o whisper_output.txt
+
+# Larger buffer and monitor throughput
+MBUFFER_MEM=5G BUFFER_SEC=2.0 MONITOR=1 ./whisper.sh -o whisper_output.txt
+```
+
 ## Building
 
 The `whisper-stream` tool depends on SDL2 library to capture audio from the microphone. You can build it like this:
