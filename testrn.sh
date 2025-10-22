@@ -9,7 +9,7 @@ MODEL="./models/ggml-large-v3.bin"
 EOS_CONF="./eos_defaults.conf"
 RNN="$HOME/rnnoise-models/std.rnnn"
 
-exec 3> stream_long_v68c_rnnoise.mux
+exec 3> stream_long_v68d_rnnoise.mux
 
 # === PIPELINE ===
 ffmpeg -hide_banner -nostats -loglevel warning \
