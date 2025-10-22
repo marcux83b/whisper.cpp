@@ -4,7 +4,7 @@ set -euo pipefail
 mux_err() { while IFS= read -r line; do printf "[ERR] %s\n" "$line" >&3; done; }
 mux_out() { while IFS= read -r line; do printf "[OUT] %s\n" "$line" >&3; done; }
 
-exec 3> stream_long_v68b.mux
+exec 3> stream_long_v68c.mux
 cat mic_test_long_gain_68.raw \
 | stdbuf -oL -eL ./build/bin/whisper-stream \
     -m ./models/ggml-large-v3.bin \
