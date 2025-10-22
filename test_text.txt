@@ -1,0 +1,21 @@
+Hello. My name is Marco, and this is a voice detection test.
+
+I’m speaking at a normal pace right now, with a short pause... here.
+
+Now I’m going to speak a little faster to see if the model can keep up, without losing track of the words or chopping them apart mid-sentence.
+
+Okay, slowing down again... testing long silences — I’ll pause for a moment.
+
+(pause 2 seconds)
+
+Alright, I’m back. This section includes some filler phrases, like “uh”, “you know”, and “sort of”, to see if they trigger false endings.
+
+Now let’s try a bit of varied tone — louder, softer, then back to normal.
+
+Finally, I’ll end with two short sentences.
+
+This is the first one.
+
+And this is the second.
+
+End of test.
