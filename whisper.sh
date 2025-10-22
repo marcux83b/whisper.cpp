@@ -36,7 +36,7 @@ ffmpeg -hide_banner -nostats -loglevel warning \
                    volume=1.9,aresample=resampler=soxr:async=1:first_pts=0,asetpts=N/SR/TB" \
   -ac 1 -ar 16000 -f f32le - \
 | ./build/bin/whisper-stream \
-     -m ./models/ggml-large-v3.bin \
+     -m "$MODEL" \
      --stdin --stdin-format f32le \
      --eos-config ./eos_defaults.conf \
      --debug-eos
