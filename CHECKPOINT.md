@@ -1,8 +1,9 @@
-# 🎙️ Whisper-Stream Live Transcription Project — Primer & Technical Summary
+
+# 🎙️ Whisper-Stream Live Transcription Project — Updated Technical Checkpoint (`v69b_mbuffer-sync`)
 
 ### 🧩 Core Goal
 
-Create a **deterministic, reproducible live transcription pipeline** around `whisper.cpp`, capable of robust voice detection (EOS/VAD) and adaptive noise handling — suitable for continuous dictation, meetings, or conversation monitoring in real time.
+Create a **deterministic, reproducible live transcription pipeline** around `whisper.cpp`, capable of robust voice detection (EOS/VAD), adaptive noise handling, and now **decoupled streaming throughput** — suitable for continuous dictation, meetings, or multi-hour live audio with no dropouts.
 
 ---
 
@@ -12,44 +13,46 @@ Create a **deterministic, reproducible live transcription pipeline** around `whi
 
 * **Audio Ingestion:** `ffmpeg` captures two PulseAudio sources:
 
-    * `MIC_SRC` — the live microphone input
-    * `SPEAKER_SRC` — the system monitor stream (optional mix)
+    * `MIC_SRC` — live microphone input
+    * `SPEAKER_SRC` — system monitor stream (optional mix)
 * **Noise Control:**
 
     * RNNoise model (`std.rnnn`) for neural noise suppression
-    * `highpass`, `lowpass`, `compand` filters for analog shaping
+    * `highpass`, `lowpass`, and `compand` filters for analog shaping
 * **Signal Mix:** `amix` merges mic + monitor (or mic-only variant)
+* **SoX Stage (pad):**
+
+    * Inserts small silence pad (`BUFFER_SEC`, default 1.0s) to smooth edges and absorb micro-jitter.
+    * Optional but useful for future language-switch restarts.
+* **Asynchronous Buffer (`mbuffer`):**
+
+    * Provides a large in-RAM (or disk-backed) FIFO queue between producer (`ffmpeg`) and consumer (`whisper-stream`).
+    * Decouples real-time audio from model throughput — **no underruns, no dropouts.**
 * **Whisper Streamer:**
 
-    * `./build/bin/whisper-stream` reads f32le PCM from stdin
-    * Uses `--eos-config` for finely tuned end-of-speech detection
-    * Optional `--debug-eos` emits detailed state transitions
-* **Output Control:** `tee` appends transcribed text to log files
-* **Mux Logger:** Bash wrapper merges stdout (`[OUT]`) + stderr (`[ERR]`) into a single chronological trace file for debugging and EOS state analysis.
+    * `./build/bin/whisper-stream` reads f32le PCM from stdin.
+    * Uses `--eos-config` for finely tuned end-of-speech detection.
+    * Emits continuous text output (`-o output.txt`).
+* **Output Control:**
+
+    * `tail -f output.txt` for live monitoring.
+    * `mbuffer` stderr shows in/out rates and queue fullness for performance insight.
 
 ---
 
 ## 2️⃣ Deterministic Test Path
 
-To make tuning reproducible and quantifiable:
-
 ### 🧪 Process
 
 1. **Record controlled input**
-
-    * `mic_test_long_gain_68.raw` — a single-speaker narration with calibrated gain.
-2. **Play back deterministically**
-
-    * Feed into pipeline via `ffmpeg -f f32le -ar 16000 -ac 1 -i mic_test_long_gain_68.raw`.
+   `mic_test_long_gain_68.raw` — single-speaker narration with calibrated gain.
+2. **Playback deterministically**
+   Feed into pipeline via `ffmpeg -f f32le -ar 16000 -ac 1 -i mic_test_long_gain_68.raw`.
 3. **Log full EOS state machine**
-
-    * `stdout` = recognized text
-    * `stderr` = `[ERR] EOS: ...` transitions
-    * Both merged into `.mux` files for analysis.
+   `stderr` captures `[ERR] EOS:` transitions for quantitative comparison.
 4. **Iterate configuration files**
-
-    * Successive versions: `v68b`, `v68c`, `v68c_rnnoise`, `v68d_rnnoise`, `v68h`
-    * Each change isolated, compared by metrics (flush count, span length, false triggers).
+   `v68b` → `v68h` (final EOS stable).
+5. **Quantify performance** by metrics (transition count, flush timing, VOICE span).
 
 ### 📊 Outcome Metrics
 
@@ -64,11 +67,11 @@ To make tuning reproducible and quantifiable:
 
 ---
 
-## 3️⃣ Live Test Path
+## 3️⃣ Live Test Path — Continuous Stream Mode
 
-After deterministic stability was proven, live tests were run with the same EOS config and RNNoise active:
+After achieving EOS stability, the live pipeline was upgraded to **fully decoupled mode**:
 
-### 🎧 Configuration (final form)
+### 🎧 Configuration (`v69b_mbuffer-sync`)
 
 ```bash
 ffmpeg -hide_banner -nostats -loglevel warning \
@@ -79,13 +82,14 @@ ffmpeg -hide_banner -nostats -loglevel warning \
                    [0:a]aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000[speaker]; \
                    [mic][speaker]amix=inputs=2:duration=shortest:dropout_transition=2, \
                       highpass=f=120,lowpass=f=3500,compand=attacks=0.2:decays=0.4:points=-90/-900|-70/-70|-40/-20|0/0, \
-                      volume=1.9,aresample=resampler=soxr:async=1:first_pts=0,asetpts=N/SR/TB" \
+                      volume=1.9,aresample=resampler=soxr:async=0:first_pts=0,asetpts=N/SR/TB" \
   -ac 1 -ar 16000 -f f32le - \
-| ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" \
-| tee -a whisper_output.txt
+| sox -t f32 - -t f32 - -- pad 0 "${BUFFER_SEC:-1.0}" \
+| mbuffer -m "${MBUFFER_MEM:-2G}" -s "${MBUFFER_BLOCK:-64k}" -o - \
+| ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" -o output.txt
 ```
 
-### ⚙️ Final Parameters (`v68h.conf`)
+### ⚙️ EOS Parameters (`v68h.conf`)
 
 ```ini
 eos-on=0.0170
@@ -98,42 +102,49 @@ eos-flush-zero-ms=1000
 
 ### 💬 Live Results
 
-* No false “thank you” or phantom activations.
-* Stable EOS hysteresis: single clean VOICE/HANG/FLUSH per phrase.
-* Pauses & resumes handled naturally.
-* End-of-stream tail merged correctly.
+* No more “you/thank you” repetition loops.
+* No underruns, no dropouts — steady processing regardless of speech duration.
+* EOS remains stable with clear VOICE/HANG/FLUSH boundaries.
+* GPU stays active consistently; throughput stable around 64 kB/s.
+* Tested against continuous YouTube speech streams (multi-minute monologues).
 
 ---
 
 ## 4️⃣ Tuning Philosophy
 
-### 🧠 Key Concepts
-
-* **Determinism first:** all tuning against a known input before live chaos.
-* **Isolate variables:** only change one dimension (EOS, RNNoise mix, filters) per test.
-* **State-aware logs:** `[ERR] EOS:` traces are gold — reveal every decision.
-* **Metric tracking:** count transitions, flushes, and VOICE spans to quantify progress.
-* **Reproducible labeling:** commit each EOS config with version tags in git for auditability.
+* **Determinism first:** all thresholds tuned offline against deterministic input.
+* **Isolation:** change one variable per iteration (EOS, filters, buffer, etc.).
+* **Reproducibility:** every config version committed with tag (`v68b`→`v69b`).
+* **Separation of concerns:** ffmpeg = capture, sox = signal conditioning, mbuffer = queue, whisper = inference.
+* **Resilience:** model can lag safely; never loses data.
 
 ---
 
 ## 5️⃣ Project State & Next Steps
 
-✅ **Baseline achieved:**
-`v68h` — stable, low-false-positive, live-ready EOS config.
+✅ **Stable baseline:**
+`v69b_mbuffer-sync` — fully decoupled continuous transcription with EOS-stable config.
 
-🚀 **Next phases:**
+🚀 **Next Phases:**
 
-* Field-test in meetings and Discord (evaluate latency & multi-speaker behavior)
-* Optionally benchmark smaller Whisper models (medium/small) for speed vs accuracy
-* Add optional per-chunk timestamping for real-time UI or post-processing alignment
-* Eventually wrap in a thin Python or Rust layer for streaming to an app interface
+* Add **language-switch detection (en/de)** and smooth re-initialization of Whisper via pad buffer.
+* Implement **periodic auto-restart** of `whisper-stream` with seamless handoff.
+* Optional monitoring layer to log `mbuffer` occupancy + GPU utilization.
+* Investigate smaller Whisper models for lower latency on weaker GPUs.
+* UI/daemon integration: real-time transcript viewer or web socket feed.
 
 ---
 
 ### 🧭 Essence
 
-This project transformed `whisper.cpp` from a passive model into a **real-time, speech-aware transcription instrument** —
-data-driven, empirically tuned, and reproducible down to each dB threshold.
+The pipeline has evolved from a timing-sensitive prototype into a **robust, self-paced transcription system**.
+`mbuffer` now provides asynchronous flow control, while SoX and RNNoise preserve audio clarity.
+`whisper.cpp` effectively becomes a *real-time transcription backend*, resilient to pauses, overloads, and extended speech —
+a foundation for future language-aware, adaptive streaming.
+
+---
+
+✅ **Current Baseline:** `v69b_mbuffer-sync`
+🧠 **Core Principles:** determinism · decoupling · reproducibility · clarity
 
 ---
