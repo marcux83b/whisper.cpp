@@ -13,6 +13,17 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cmath>
+#include <array>
+#include <functional>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 // command-line parameters
 struct whisper_params {
@@ -45,9 +56,60 @@ struct whisper_params {
     std::string fname_out;
 };
 
+// end-of-speech (EOS) detection parameters for stdin streaming
+struct eos_params {
+    float on  = 0.0085f;   // RMS threshold to enter speech (~ -44 dBFS)
+    float off = 0.0045f;   // RMS threshold to leave speech (~ -49 dBFS)
+    int   hang_ms = 200;   // keep 'speech' this long after last loud frame
+    int   preroll_ms = 200;      // prepend audio at speech start
+    int   flush_zero_ms = 1000;  // flush if this many ms of zeros
+    int   min_chunk_ms  = 600;   // ignore blips shorter than this
+    bool  debug = false;         // log EOS decisions
+};
+
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
 
-static bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
+static bool load_eos_config_file(const std::string & path, eos_params & eos) {
+    std::ifstream fin(path);
+    if (!fin.is_open()) {
+        fprintf(stderr, "warning: failed to open EOS config '%s'\n", path.c_str());
+        return false;
+    }
+    std::string line;
+    int count = 0;
+    while (std::getline(fin, line)) {
+        // strip comments
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        // trim
+        auto ltrim = [](std::string & s){ s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch){ return !std::isspace(ch); })); };
+        auto rtrim = [](std::string & s){ s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch){ return !std::isspace(ch); }).base(), s.end()); };
+        ltrim(line); rtrim(line);
+        if (line.empty()) continue;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq+1);
+        ltrim(key); rtrim(key); ltrim(val); rtrim(val);
+        if (key == "eos-on") eos.on = std::stof(val);
+        else if (key == "eos-off") eos.off = std::stof(val);
+        else if (key == "eos-hang-ms") eos.hang_ms = std::stoi(val);
+        else if (key == "eos-preroll-ms") eos.preroll_ms = std::stoi(val);
+        else if (key == "eos-flush-zero-ms") eos.flush_zero_ms = std::stoi(val);
+        else if (key == "eos-min-chunk-ms") eos.min_chunk_ms = std::stoi(val);
+        else if (key == "debug-eos") {
+            if (val == "1" || val == "true" || val == "yes" ) eos.debug = true; else eos.debug = false;
+        } else {
+            // ignore unknown keys
+            continue;
+        }
+        ++count;
+    }
+    fprintf(stderr, "loaded EOS config '%s' (%d entries)\n", path.c_str(), count);
+    return true;
+}
+
+static bool whisper_params_parse(int argc, char ** argv, whisper_params & params, eos_params & eos) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -79,6 +141,15 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
         else if (                  arg == "--stdin")          { params.use_stdin     = true; }
         else if (                  arg == "--stdin-format")   { params.stdin_format  = argv[++i]; }
+        else if (                  arg == "--eos-config")     { load_eos_config_file(argv[++i], eos); }
+        // EOS flags (stdin streaming)
+        else if (                  arg == "--eos-on")         { eos.on              = std::stof(argv[++i]); }
+        else if (                  arg == "--eos-off")        { eos.off             = std::stof(argv[++i]); }
+        else if (                  arg == "--eos-hang-ms")    { eos.hang_ms         = std::stoi(argv[++i]); }
+        else if (                  arg == "--eos-preroll-ms") { eos.preroll_ms      = std::stoi(argv[++i]); }
+        else if (                  arg == "--eos-flush-zero-ms") { eos.flush_zero_ms = std::stoi(argv[++i]); }
+        else if (                  arg == "--eos-min-chunk-ms")  { eos.min_chunk_ms  = std::stoi(argv[++i]); }
+        else if (                  arg == "--debug-eos")      { eos.debug           = true; }
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -120,17 +191,76 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -nfa,     --no-flash-attn [%-7s] disable flash attention during inference\n",       params.flash_attn ? "false" : "true");
     fprintf(stderr, "            --stdin         [%-7s] read PCM audio from stdin (no device)\n",           params.use_stdin ? "true" : "false");
     fprintf(stderr, "            --stdin-format  [%-7s] stdin PCM format: f32le or s16le\n",           params.stdin_format.c_str());
+    fprintf(stderr, "            --eos-config F  [    none] load EOS params from key=value config file\n");
+    fprintf(stderr, "            --eos-on F      [    0.0085] RMS to enter speech (stdin EOS)\n");
+    fprintf(stderr, "            --eos-off F     [    0.0045] RMS to leave speech (stdin EOS)\n");
+    fprintf(stderr, "            --eos-hang-ms N [        200] Hang time after last loud frame\n");
+    fprintf(stderr, "            --eos-preroll-ms N[       200] Prepend this much audio at start\n");
+    fprintf(stderr, "            --eos-flush-zero-ms N[    1000] Flush if this much zero-run\n");
+    fprintf(stderr, "            --eos-min-chunk-ms N[      600] Ignore blips shorter than this\n");
+    fprintf(stderr, "            --debug-eos     [   optional] Log EOS decisions to stderr\n");
     fprintf(stderr, "\n");
+}
+
+// ===== EOS helpers (20 ms frames @ 16k) =====
+namespace eos_helpers {
+    constexpr int SR = 16000;
+    constexpr int FRAME_SAMPLES = SR * 20 / 1000; // 320
+
+    inline float frame_rms(const float* p, int n) {
+        double acc = 0.0;
+        for (int i = 0; i < n; ++i) { double x = p[i]; acc += x*x; }
+        return (float) std::sqrt(acc / n);
+    }
+    inline bool is_zero_frame(const float* p, int n) {
+        for (int i = 0; i < n; ++i) if (std::fabs(p[i]) > 1e-7f) return false;
+        return true;
+    }
+    inline int ms_to_frames(int ms) { return std::max(1, ms / 20); }
+
+    struct float_ring {
+        std::vector<float> buf; size_t w = 0; bool full = false;
+        explicit float_ring(size_t cap) : buf(cap) {}
+        void push(const float* p, size_t n) {
+            for (size_t i=0;i<n;++i) { buf[w] = p[i]; w=(w+1)%buf.size(); if (w==0) full=true; }
+        }
+        void dump_to(std::vector<float>& out) const {
+            if (!full && w==0) return;
+            if (!full) { out.insert(out.end(), buf.begin(), buf.begin()+w); }
+            else {
+                out.insert(out.end(), buf.begin()+w, buf.end());
+                out.insert(out.end(), buf.begin(), buf.begin()+w);
+            }
+        }
+        void clear() { w=0; full=false; }
+    };
+
+    enum class State { IDLE, VOICE, HANG, ARMED };
+    struct state_t {
+        State st = State::IDLE;
+        int hang = 0;
+        int zero_run = 0;
+        int frames_in_chunk = 0;
+    };
 }
 
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     whisper_params params;
+    eos_params eos;
 
-    if (whisper_params_parse(argc, argv, params) == false) {
+    if (whisper_params_parse(argc, argv, params, eos) == false) {
         return 1;
     }
+
+    // detect if stdout is a TTY (interactive console)
+    bool stdout_is_tty = true;
+#ifdef _WIN32
+    stdout_is_tty = _isatty(_fileno(stdout)) != 0;
+#else
+    stdout_is_tty = isatty(fileno(stdout)) != 0;
+#endif
 
     params.keep_ms   = std::min(params.keep_ms,   params.step_ms);
     params.length_ms = std::max(params.length_ms, params.step_ms);
@@ -151,24 +281,13 @@ int main(int argc, char ** argv) {
     // init audio
 
     audio_async audio(params.length_ms);
-    if (params.use_stdin) {
-        // basic validation
-        if (params.stdin_format != "f32le" && params.stdin_format != "s16le") {
-            fprintf(stderr, "%s: invalid --stdin-format '%s' (expected 'f32le' or 's16le')\n", __func__, params.stdin_format.c_str());
-            return 1;
-        }
-        if (!audio.init_stdin(WHISPER_SAMPLE_RATE, params.stdin_format)) {
-            fprintf(stderr, "%s: audio.init_stdin() failed!\n", __func__);
-            return 1;
-        }
-    } else {
+    if (!params.use_stdin) {
         if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
             fprintf(stderr, "%s: audio.init() failed!\n", __func__);
             return 1;
         }
+        audio.resume();
     }
-
-    audio.resume();
 
     // whisper init
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
@@ -258,13 +377,225 @@ int main(int argc, char ** argv) {
     auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
 
-    // main audio loop
-    while (is_running) {
-        // If reading from stdin, exit cleanly on EOF
-        if (params.use_stdin && audio.is_stdin_eof()) {
-            fprintf(stderr, "End of stdin reached, exiting cleanly.\n");
-            break;
+    // If stdin mode, run EOS-driven frame loop
+    if (params.use_stdin) {
+        // stdin reader lambdas
+        using namespace eos_helpers;
+
+        std::function<bool(float*,int)> read_frame;
+        if (params.stdin_format == std::string("s16le")) {
+            read_frame = [&](float* out, int n){
+                std::vector<int16_t> tmp(n);
+                size_t n_read = fread(tmp.data(), sizeof(int16_t), n, stdin);
+                if (n_read < (size_t)n) {
+                    if (feof(stdin)) return false;
+                    // partial frame: pad zeros
+                    for (size_t i = 0; i < n_read; ++i) out[i] = tmp[i] / 32768.0f;
+                    for (int i = (int)n_read; i < n; ++i) out[i] = 0.0f;
+                    return true;
+                }
+                for (int i = 0; i < n; ++i) out[i] = tmp[i] / 32768.0f;
+                return true;
+            };
+        } else { // f32le
+            read_frame = [&](float* out, int n){
+                size_t n_read = fread(out, sizeof(float), n, stdin);
+                if (n_read < (size_t)n) {
+                    if (feof(stdin)) return false;
+                    for (int i = (int)n_read; i < n; ++i) out[i] = 0.0f;
+                    return true;
+                }
+                return true;
+            };
         }
+
+        // decode wrapper
+        int n_iter_eos = 0;
+        auto decode_chunk = [&](const std::vector<float>& buf){
+            if (buf.empty()) return;
+            whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
+            wparams.print_progress   = false;
+            wparams.print_special    = params.print_special;
+            wparams.print_realtime   = false;
+            wparams.print_timestamps = !params.no_timestamps;
+            wparams.translate        = params.translate;
+            wparams.single_segment   = true; // same as non-VAD streaming
+            wparams.max_tokens       = params.max_tokens;
+            wparams.language         = params.language.c_str();
+            wparams.n_threads        = params.n_threads;
+            wparams.beam_search.beam_size = params.beam_size;
+            wparams.audio_ctx        = params.audio_ctx;
+            wparams.tdrz_enable      = params.tinydiarize;
+            wparams.temperature_inc  = params.no_fallback ? 0.0f : wparams.temperature_inc;
+            wparams.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
+            wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
+
+            if (whisper_full(ctx, wparams, buf.data(), buf.size()) != 0) {
+                fprintf(stderr, "%s: failed to process audio (stdin/EOS)\n", argv[0]);
+                return;
+            }
+
+            // printing similar to non-VAD path
+            if (stdout_is_tty) {
+                printf("\33[2K\r");
+                printf("%s", std::string(100, ' ').c_str());
+                printf("\33[2K\r");
+            } else {
+                printf("\n");
+            }
+
+            const int n_segments = whisper_full_n_segments(ctx);
+            for (int i = 0; i < n_segments; ++i) {
+                const char * text = whisper_full_get_segment_text(ctx, i);
+                if (params.no_timestamps) {
+                    printf("%s", text);
+                    fflush(stdout);
+                    if (params.fname_out.length() > 0) {
+                        fout << text;
+                    }
+                } else {
+                    const int64_t t0s = whisper_full_get_segment_t0(ctx, i);
+                    const int64_t t1s = whisper_full_get_segment_t1(ctx, i);
+                    std::string output = "[" + to_timestamp(t0s, false) + " --> " + to_timestamp(t1s, false) + "]  " + text;
+                    output += "\n";
+                    printf("%s", output.c_str());
+                    fflush(stdout);
+                    if (params.fname_out.length() > 0) {
+                        fout << output;
+                    }
+                }
+            }
+            if (params.fname_out.length() > 0) {
+                fout << std::endl;
+            }
+            ++n_iter_eos;
+
+            // update prompt tokens to keep context across chunks
+            if (!params.no_context) {
+                prompt_tokens.clear();
+                const int n_segments2 = whisper_full_n_segments(ctx);
+                for (int i = 0; i < n_segments2; ++i) {
+                    const int token_count = whisper_full_n_tokens(ctx, i);
+                    for (int j = 0; j < token_count; ++j) {
+                        prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
+                    }
+                }
+            }
+        };
+
+        auto dbg = [&](const char* m){ if (eos.debug) fprintf(stderr, "%s\n", m); };
+
+        eos_helpers::float_ring preroll(eos_helpers::ms_to_frames(eos.preroll_ms) * eos_helpers::FRAME_SAMPLES);
+        std::vector<float> chunk; chunk.reserve(8*eos_helpers::FRAME_SAMPLES);
+        eos_helpers::state_t S;
+        std::array<float, eos_helpers::FRAME_SAMPLES> fr;
+        const int HANG_FR   = eos_helpers::ms_to_frames(eos.hang_ms);
+        const int FLUSHZ_FR = eos_helpers::ms_to_frames(eos.flush_zero_ms);
+        const int MIN_FR    = eos_helpers::ms_to_frames(eos.min_chunk_ms);
+
+        auto flush_now = [&](){
+            if ((int)chunk.size() >= MIN_FR * eos_helpers::FRAME_SAMPLES) {
+                dbg("EOS: FLUSH");
+                decode_chunk(chunk);
+            } else {
+                dbg("EOS: DROP tiny");
+            }
+            chunk.clear(); S.frames_in_chunk = 0; preroll.clear();
+            S.st = eos_helpers::State::IDLE;
+        };
+
+        // Main frame loop
+        while (true) {
+            if (!read_frame(fr.data(), eos_helpers::FRAME_SAMPLES)) {
+                // EOF: flush any pending
+                if (!chunk.empty()) flush_now();
+                break;
+            }
+
+            if (params.save_audio) {
+                wavWriter.write(fr.data(), fr.size());
+            }
+
+            const bool zero = eos_helpers::is_zero_frame(fr.data(), eos_helpers::FRAME_SAMPLES);
+            S.zero_run = zero ? (S.zero_run + 1) : 0;
+            const float rms = eos_helpers::frame_rms(fr.data(), eos_helpers::FRAME_SAMPLES);
+            const bool on  = (rms >= eos.on);
+            const bool off = (rms <  eos.off);
+
+            // preroll always records
+            preroll.push(fr.data(), eos_helpers::FRAME_SAMPLES);
+
+            switch (S.st) {
+                case eos_helpers::State::IDLE:
+                    if (on && !zero) {
+                        preroll.dump_to(chunk);
+                        chunk.insert(chunk.end(), fr.begin(), fr.end());
+                        S.frames_in_chunk = (int)(chunk.size()/eos_helpers::FRAME_SAMPLES);
+                        S.hang = HANG_FR;
+                        S.st = eos_helpers::State::VOICE;
+                        dbg("EOS: IDLE->VOICE");
+                    }
+                    break;
+                case eos_helpers::State::VOICE:
+                    chunk.insert(chunk.end(), fr.begin(), fr.end());
+                    ++S.frames_in_chunk;
+                    if (on && !zero) {
+                        S.hang = HANG_FR;
+                    } else {
+                        S.st = eos_helpers::State::HANG; dbg("EOS: VOICE->HANG");
+                    }
+                    break;
+                case eos_helpers::State::HANG:
+                    chunk.insert(chunk.end(), fr.begin(), fr.end());
+                    ++S.frames_in_chunk;
+                    if (on && !zero) {
+                        S.st = eos_helpers::State::VOICE; S.hang = HANG_FR; dbg("EOS: HANG->VOICE");
+                    } else {
+                        if (--S.hang <= 0) { S.st = eos_helpers::State::ARMED; dbg("EOS: HANG->ARMED"); }
+                    }
+                    break;
+                case eos_helpers::State::ARMED:
+                    if (S.zero_run >= FLUSHZ_FR || off) {
+                        flush_now();
+                    } else if (on && !zero) {
+                        S.st = eos_helpers::State::VOICE; S.hang = HANG_FR;
+                        chunk.insert(chunk.end(), fr.begin(), fr.end());
+                        ++S.frames_in_chunk;
+                        dbg("EOS: ARMED->VOICE");
+                    }
+                    break;
+            }
+
+            // mid-slice long utterances using --length/--keep
+            if (S.st != eos_helpers::State::IDLE) {
+                const int cur_ms = S.frames_in_chunk * 20;
+                if (cur_ms >= params.length_ms) {
+                    // decode current chunk but keep the last --keep ms
+                    decode_chunk(chunk);
+                    const int keep_samps = (int)((WHISPER_SAMPLE_RATE * params.keep_ms) / 1000);
+                    if (keep_samps > 0 && (int)chunk.size() > keep_samps) {
+                        std::vector<float> kept(chunk.end() - keep_samps, chunk.end());
+                        chunk.swap(kept);
+                    } else {
+                        chunk.clear();
+                    }
+                    S.frames_in_chunk = (int)(chunk.size()/eos_helpers::FRAME_SAMPLES);
+                    preroll.clear(); // avoid duplicating preroll mid-utterance
+                    dbg("EOS: MID-SLICE");
+                }
+            }
+        }
+
+        // stdin mode done
+        audio.pause();
+        whisper_print_timings(ctx);
+        whisper_free(ctx);
+        return 0;
+    }
+
+    // main audio loop (microphone / SDL)
+    while (is_running) {
+        // stdin path handled earlier
         if (params.save_audio) {
             wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
         }
@@ -378,12 +709,15 @@ int main(int argc, char ** argv) {
             // print result;
             {
                 if (!use_vad) {
-                    printf("\33[2K\r");
-
-                    // print long empty line to clear the previous line
-                    printf("%s", std::string(100, ' ').c_str());
-
-                    printf("\33[2K\r");
+                    if (stdout_is_tty) {
+                        printf("\33[2K\r");
+                        // print long empty line to clear the previous line
+                        printf("%s", std::string(100, ' ').c_str());
+                        printf("\33[2K\r");
+                    } else {
+                        // when stdout is not a TTY, do not overwrite; add a newline separator
+                        printf("\n");
+                    }
                 } else {
                     const int64_t t1 = (t_last - t_start).count()/1000000;
                     const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
