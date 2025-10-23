@@ -63,6 +63,7 @@ struct whisper_params {
     float      auto_lang_threshold = 0.75f;      // min prob to switch
     std::string auto_lang_fallback = "en";      // fallback before first detection
     bool       debug_auto_lang     = false;      // verbose logs for auto-lang
+    float      auto_lang_window_sec = 3.0f;      // seconds of most-recent audio used for detection
 };
 
 // end-of-speech (EOS) detection parameters for stdin streaming
@@ -154,6 +155,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--auto-lang-reeval")   { params.auto_lang_reeval    = std::stof(argv[++i]); }
         else if (                  arg == "--auto-lang-threshold"){ params.auto_lang_threshold = std::stof(argv[++i]); }
         else if (                  arg == "--auto-lang-fallback") { params.auto_lang_fallback  = argv[++i]; }
+        else if (                  arg == "--auto-lang-window-sec") { params.auto_lang_window_sec = std::stof(argv[++i]); }
         else if (                  arg == "--eos-config")     { load_eos_config_file(argv[++i], eos); }
         // EOS flags (stdin streaming)
         else if (                  arg == "--eos-on")         { eos.on              = std::stof(argv[++i]); }
@@ -209,6 +211,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "            --auto-lang-reeval S   [    0.00] Periodically re-evaluate language every S seconds (0=off)\n");
     fprintf(stderr, "            --auto-lang-threshold F [    0.75] Min probability to accept language switch\n");
     fprintf(stderr, "            --auto-lang-fallback L  [      en] Fallback language before first detection (with --language auto)\n");
+    fprintf(stderr, "            --auto-lang-window-sec S[     3.0] Seconds of most-recent audio used for detection\n");
     fprintf(stderr, "            --debug-auto-lang       [   optional] Verbose auto-language detection logs\n");
     fprintf(stderr, "            --eos-on F      [    0.0085] RMS to enter speech (stdin EOS)\n");
     fprintf(stderr, "            --eos-off F     [    0.0045] RMS to leave speech (stdin EOS)\n");
@@ -594,10 +597,18 @@ int main(int argc, char ** argv) {
                 auto now = std::chrono::steady_clock::now();
                 double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_lang_eval).count() / 1000.0;
                 if (elapsed >= params.auto_lang_reeval && recent_pcm.size() >= (size_t)(16000 * 2)) { // need at least ~2s
-                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs)\n", elapsed, recent_pcm.size()/16000.0);
+                    // Use only the most recent window from recent_pcm
+                    size_t win_samps = (size_t) std::max(1.0f, params.auto_lang_window_sec) * 16000;
+                    if (win_samps > recent_pcm.size()) win_samps = recent_pcm.size();
+                    const float *win_ptr = recent_pcm.data() + (recent_pcm.size() - win_samps);
+                    // RMS gate to avoid evaluating silence
+                    double acc = 0.0; for (size_t qi = 0; qi < win_samps; ++qi) { double x = win_ptr[qi]; acc += x*x; }
+                    float rms_win = std::sqrt(acc / std::max<size_t>(1, win_samps));
+                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs, win=%.1fs, rms=%.5f)\n", elapsed, recent_pcm.size()/16000.0, win_samps/16000.0, rms_win);
+                    if (rms_win < 0.001f) { last_lang_eval = now; continue; }
                     std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
                     // compute mel on separate state to avoid interfering with decode
-                    if (whisper_pcm_to_mel_with_state(ctx, lang_state, recent_pcm.data(), recent_pcm.size(), params.n_threads) == 0) {
+                    if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
                         int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
                         if (lang_new_id >= 0) {
                             float prob_new = lang_probs[lang_new_id];
@@ -821,20 +832,32 @@ int main(int argc, char ** argv) {
                     auto now = std::chrono::steady_clock::now();
                     double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_lang_eval).count() / 1000.0;
                     if (elapsed >= params.auto_lang_reeval && recent_pcm.size() >= (size_t)(16000 * 2)) {
-                        if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs)\n", elapsed, recent_pcm.size()/16000.0);
-                        std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
-                        if (whisper_pcm_to_mel_with_state(ctx, lang_state, recent_pcm.data(), recent_pcm.size(), params.n_threads) == 0) {
-                            int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
-                            if (lang_new_id >= 0) {
-                                float prob_new = lang_probs[lang_new_id];
-                                const char* lang_new = whisper_lang_str(lang_new_id);
-                                if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
-                                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Detected switch: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
-                                    current_lang = lang_new;
-                                    has_detected_lang = true;
-                                    prompt_tokens.clear();
-                                } else {
-                                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Keeping %s (p=%.2f)\n", current_lang.c_str(), prob_new);
+                        // most-recent window
+                        size_t win_samps = (size_t) std::max(1.0f, params.auto_lang_window_sec) * 16000;
+                        if (win_samps > recent_pcm.size()) win_samps = recent_pcm.size();
+                        const float *win_ptr = recent_pcm.data() + (recent_pcm.size() - win_samps);
+                        // RMS gate
+                        double acc = 0.0; for (size_t qi = 0; qi < win_samps; ++qi) { double x = win_ptr[qi]; acc += x*x; }
+                        float rms_win = std::sqrt(acc / std::max<size_t>(1, win_samps));
+                        if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs, win=%.1fs, rms=%.5f)\n", elapsed, recent_pcm.size()/16000.0, win_samps/16000.0, rms_win);
+                        if (rms_win < 0.001f) { last_lang_eval = now; /* skip eval on silence */ }
+                        else {
+                            std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
+                            if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
+                                int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
+                                if (lang_new_id >= 0) {
+                                    float prob_new = lang_probs[lang_new_id];
+                                    const char* lang_new = whisper_lang_str(lang_new_id);
+                                    if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
+                                        if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Detected switch: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
+                                        current_lang = lang_new;
+                                        has_detected_lang = true;
+                                        prompt_tokens.clear();
+                                        if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] switched decode language to %s\n", current_lang.c_str());
+                                        skip_decode_once_after_switch = true;
+                                    } else {
+                                        if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Keeping %s (p=%.2f)\n", current_lang.c_str(), prob_new);
+                                    }
                                 }
                             }
                         }
