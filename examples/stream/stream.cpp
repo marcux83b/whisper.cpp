@@ -606,6 +606,9 @@ int main(int argc, char ** argv) {
                     float rms_win = std::sqrt(acc / std::max<size_t>(1, win_samps));
                     if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs, win=%.1fs, rms=%.5f)\n", elapsed, recent_pcm.size()/16000.0, win_samps/16000.0, rms_win);
                     if (rms_win < 0.001f) { last_lang_eval = now; continue; }
+                    // re-init detection state to avoid residual KV/cache bias across evaluations
+                    if (lang_state) whisper_free_state(lang_state);
+                    lang_state = whisper_init_state(ctx);
                     std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
                     // compute mel on separate state to avoid interfering with decode
                     if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
@@ -850,8 +853,11 @@ int main(int argc, char ** argv) {
                         if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs, win=%.1fs, rms=%.5f)\n", elapsed, recent_pcm.size()/16000.0, win_samps/16000.0, rms_win);
                         if (rms_win < 0.001f) { last_lang_eval = now; /* skip eval on silence */ }
                         else {
-                            std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
-                            if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
+                        // re-init detection state to avoid residual KV/cache bias across evaluations
+                        if (lang_state) whisper_free_state(lang_state);
+                        lang_state = whisper_init_state(ctx);
+                        std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
+                        if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
                                 int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
                                 if (lang_new_id >= 0) {
                                     float prob_new = lang_probs[lang_new_id];
