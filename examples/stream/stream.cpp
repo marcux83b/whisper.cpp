@@ -400,6 +400,7 @@ int main(int argc, char ** argv) {
     const bool auto_lang_enabled = (params.language == "auto" && params.auto_lang_reeval > 0.0f);
     std::string current_lang = (params.language == "auto") ? params.auto_lang_fallback : params.language;
     bool has_detected_lang = false;
+    bool skip_decode_once_after_switch = false;
     auto last_lang_eval = std::chrono::steady_clock::now();
     std::vector<float> recent_pcm; recent_pcm.reserve(16000 * 10);
     auto push_recent = [&](const float* data, size_t n){
@@ -454,6 +455,11 @@ int main(int argc, char ** argv) {
         int n_iter_eos = 0;
         auto decode_chunk = [&](const std::vector<float>& buf){
             if (buf.empty()) return;
+            if (skip_decode_once_after_switch) {
+                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] skipping one decode after switch to %s\n", current_lang.c_str());
+                skip_decode_once_after_switch = false;
+                return;
+            }
             whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
             wparams.print_progress   = false;
             wparams.print_special    = params.print_special;
@@ -601,6 +607,8 @@ int main(int argc, char ** argv) {
                                 current_lang = lang_new;
                                 has_detected_lang = true;
                                 prompt_tokens.clear();
+                                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] switched decode language to %s\n", current_lang.c_str());
+                                skip_decode_once_after_switch = true;
                             } else {
                                 if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Keeping %s (p=%.2f)\n", current_lang.c_str(), prob_new);
                             }
@@ -769,6 +777,12 @@ int main(int argc, char ** argv) {
 
         // run the inference
         {
+            if (skip_decode_once_after_switch) {
+                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] skipping one decode after switch to %s\n", current_lang.c_str());
+                skip_decode_once_after_switch = false;
+                // skip this iteration to let language switch settle
+                continue;
+            }
             whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
 
             wparams.print_progress   = false;
