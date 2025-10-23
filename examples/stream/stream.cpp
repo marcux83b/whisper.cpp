@@ -54,6 +54,9 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+
+    // low-confidence suppression (avg token prob threshold); 0.0 disables
+    float low_conf_threshold = 0.0f;
 };
 
 // end-of-speech (EOS) detection parameters for stdin streaming
@@ -141,6 +144,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
         else if (                  arg == "--stdin")          { params.use_stdin     = true; }
         else if (                  arg == "--stdin-format")   { params.stdin_format  = argv[++i]; }
+        else if (                  arg == "--lowconf-threshold") { params.low_conf_threshold = std::stof(argv[++i]); }
         else if (                  arg == "--eos-config")     { load_eos_config_file(argv[++i], eos); }
         // EOS flags (stdin streaming)
         else if (                  arg == "--eos-on")         { eos.on              = std::stof(argv[++i]); }
@@ -199,6 +203,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "            --eos-flush-zero-ms N[    1000] Flush if this much zero-run\n");
     fprintf(stderr, "            --eos-min-chunk-ms N[      600] Ignore blips shorter than this\n");
     fprintf(stderr, "            --debug-eos     [   optional] Log EOS decisions to stderr\n");
+    fprintf(stderr, "            --lowconf-threshold F [    0.00] Suppress segments with avg token prob below F (e.g., 0.35)\n");
     fprintf(stderr, "\n");
 }
 
@@ -447,6 +452,22 @@ int main(int argc, char ** argv) {
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i) {
                 const char * text = whisper_full_get_segment_text(ctx, i);
+
+                // low-confidence suppression: compute average token probability for this segment
+                if (params.low_conf_threshold > 0.0f) {
+                    int token_count = whisper_full_n_tokens(ctx, i);
+                    if (token_count > 0) {
+                        double sum_p = 0.0;
+                        for (int j = 0; j < token_count; ++j) {
+                            sum_p += whisper_full_get_token_p(ctx, i, j);
+                        }
+                        float avg_p = (float)(sum_p / token_count);
+                        if (avg_p < params.low_conf_threshold) {
+                            fprintf(stderr, "[debug] low conf %.2f -> skipped: '%s'\n", avg_p, text);
+                            continue;
+                        }
+                    }
+                }
                 if (params.no_timestamps) {
                     printf("%s", text);
                     fflush(stdout);
@@ -730,6 +751,22 @@ int main(int argc, char ** argv) {
                 const int n_segments = whisper_full_n_segments(ctx);
                 for (int i = 0; i < n_segments; ++i) {
                     const char * text = whisper_full_get_segment_text(ctx, i);
+
+                    // low-confidence suppression: compute average token probability for this segment
+                    if (params.low_conf_threshold > 0.0f) {
+                        int token_count = whisper_full_n_tokens(ctx, i);
+                        if (token_count > 0) {
+                            double sum_p = 0.0;
+                            for (int j = 0; j < token_count; ++j) {
+                                sum_p += whisper_full_get_token_p(ctx, i, j);
+                            }
+                            float avg_p = (float)(sum_p / token_count);
+                            if (avg_p < params.low_conf_threshold) {
+                                fprintf(stderr, "[debug] low conf %.2f -> skipped: '%s'\n", avg_p, text);
+                                continue;
+                            }
+                        }
+                    }
 
                     if (params.no_timestamps) {
                         printf("%s", text);

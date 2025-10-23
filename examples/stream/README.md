@@ -62,6 +62,27 @@ Tunable EOS flags (defaults in brackets):
 - `--eos-min-chunk-ms <int>`: ignore blips shorter than this [600]
 - `--debug-eos`: print EOS state transitions to stderr
 
+### Low-confidence suppression
+
+To filter out low-confidence segments (e.g., short hallucinations like “thank you” during silence),
+use:
+
+```
+--lowconf-threshold <float>
+```
+
+This suppresses segments whose average token probability is below the threshold. Example:
+
+```bash
+cat mic_test.raw | ./build/bin/whisper-stream \
+  -m ./models/ggml-large-v3.bin \
+  --stdin --stdin-format f32le \
+  --eos-config ./eos_defaults.conf \
+  --lowconf-threshold 0.35
+```
+
+When filtering is active, skipped segments are logged to stderr with a `[debug] low conf` message.
+
 ### Loading EOS parameters from a config file
 
 You can load tuned EOS parameters from a simple key=value config file using `--eos-config`.

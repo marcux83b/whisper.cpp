@@ -1,67 +1,101 @@
 
-## Option A — **Recommended**: Disk or memory ring buffer via `mbuffer` (robust, controllable)
+## ✅ TASKLIST: Low-Confidence Suppression for `whisper-stream`
 
-`mbuffer` is explicitly made for this: it creates a large FIFO/queue (memory- or disk-backed) between producer and consumer, supports large `-m` sizes, blocksize tuning, and will output to stdout for Whisper to read later. This is the cleanest way to accept arbitrarily large backlog and feed it smoothly.
+### 🎯 Goal
 
-### Why use `mbuffer`
+Add a configurable **low-confidence filter** to `examples/stream/stream.cpp`.
+If the average probability (`res.p_prob`) of a recognized segment is below the threshold, skip emitting text (or mark as `[GARBLED]` in debug).
 
-* Can allocate large in-RAM buffer (e.g. `-m 5G`) or fallback to disk if memory fills.
-* Handles bursts without dropping frames.
-* Keeps ffmpeg alive and writing even if whisper-stream lags.
-* Simple to drop into a pipeline: `ffmpeg ... -f f32le - | mbuffer ... -o - | whisper-stream ...`
+---
 
-### Example change for `whisper.sh` (hand-off to Codex)
+### 📂 Files
 
-Add `MBUFFER_MEM` and `MBUFFER_BLOCK` env knobs, defaulting to sane values:
+* `examples/stream/stream.cpp`
+* `examples/stream/whisper_stream_params.h` (or equivalent header where CLI params are stored)
 
-```bash
-# new env knobs (top of script)
-MBUFFER_MEM="${MBUFFER_MEM:-2G}"   # memory target for mbuffer; set to 5G if you want huge RAM buffer
-MBUFFER_BLOCK="${MBUFFER_BLOCK:-64k}"  # block size
+---
 
-# in pipeline, replace the $PIPE_CMD stage with mbuffer
-| sox -t f32 - -t f32 - -- pad 0 "${BUFFER_SEC:-1.0}" \
-| mbuffer -m "${MBUFFER_MEM}" -s "${MBUFFER_BLOCK}" -o - \
-| ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" \
-| tee -a whisper_output.txt
+### 🧩 Tasks
+
+#### 1. Add new CLI parameter
+
+```cpp
+// in params struct
+float low_conf_threshold = 0.0f;  // default off (no filtering)
+
+// in CLI parser
+else if (arg == "--lowconf-threshold" && i + 1 < argc) {
+    params.low_conf_threshold = std::stof(argv[++i]);
+}
 ```
 
-Notes for Codex:
+#### 2. Apply filter before printing output
 
-* `mbuffer -m` uses either RAM or a memory-mapped file; if RAM insufficient, it can fallback to disk with default behavior — consider adding `-f` or `--file` if you want explicit disk file backing.
-* Use `-q` to quiet logs, `-P` for progress if you want monitoring.
-* Validate `mbuffer --help` on target host; packaging: `dnf install mbuffer` on Fedora.
+Locate the block that prints recognized text, e.g.:
 
-
-## Suggested Codex patch (concrete, ready-to-apply)
-
-1. Add env knobs at top of `whisper.sh`:
-
-```bash
-# buffer / mbuffer configuration
-BUFFER_SEC="${BUFFER_SEC:-1.0}"
-MBUFFER_MEM="${MBUFFER_MEM:-2G}"
-MBUFFER_BLOCK="${MBUFFER_BLOCK:-64k}"
+```cpp
+printf("%s", res.text.c_str());
 ```
 
-2. Replace pipeline stage (where you had `$PIPE_CMD`) with mbuffer:
+Insert above it:
 
-```bash
-| sox -t f32 - -t f32 - -- pad 0 "${BUFFER_SEC}" \
-| mbuffer -m "${MBUFFER_MEM}" -s "${MBUFFER_BLOCK}" -o - \
-| ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" \
-| tee -a whisper_output.txt
+```cpp
+// --- Low-confidence suppression ---
+if (params.low_conf_threshold > 0.0f && res.p_prob < params.low_conf_threshold) {
+    fprintf(stderr,
+        "[debug] low conf %.2f -> skipped: '%s'\n",
+        res.p_prob, res.text.c_str());
+    continue; // skip low-confidence chunk
+}
+// --- End suppression ---
 ```
 
-3. Optional: Add a `FASTFEED` mode (feed as fast as possible) so Whisper consumes backlog immediately:
+#### 3. Optional: debug placeholder
 
-* If `FASTFEED=1`, run `./build/bin/whisper-stream --max-real-time 0` or patch to remove any artificial sleeps/real-time pacing (depends on whisper-stream flags). If whisper-stream lacks a flag, let it run normally — since it will consume as fast as it can from stdin.
+If you want visible placeholders for analysis (not for final output):
 
+```cpp
+if (params.low_conf_threshold > 0.0f && res.p_prob < params.low_conf_threshold) {
+    printf("[GARBLED]\n");
+    continue;
+}
+```
 
-## Resource & behavior notes for Codex / ops
+#### 4. Document in `README.md`
 
-* Set `MBUFFER_MEM` to something reasonable for your machine (e.g. `2G`, `5G`). `-m 5G` will attempt to use ~5 GiB.
-* If memory is insufficient, `mbuffer` will fallback to disk (depending on build/options). Consider specifying `-f /path/to/bufferfile` to force disk backing.
-* If you want the consumer to deliberately process backlog as fast as possible, ensure whisper-stream has no built-in real-time limiter. If it does, add an option or patch that disables it.
-* Monitor disk usage if you choose disk fallback.
-* If you want to watch buffer occupancy: `mbuffer` prints stats by default unless `-q`; use `-P` or parse its output for occupancy metrics.
+Add one line under **Advanced Parameters**:
+
+> `--lowconf-threshold <float>` — suppress output segments with average confidence below this value (e.g., `0.35`).
+
+---
+
+### 🧪 Test Plan
+
+1. Run `whisper-stream` on a known noisy clip with and without `--lowconf-threshold 0.35`.
+2. Verify that low-confidence “thank you” / “you” artifacts are skipped.
+3. Observe `[debug] low conf` messages in stderr.
+4. Ensure genuine speech (p_prob > threshold) is unaffected.
+
+---
+
+### 🧭 Example Run
+
+```bash
+./build/bin/whisper-stream \
+  --eos-config eos_defaults.conf \
+  --lowconf-threshold 0.35 \
+  -m models/ggml-large-v3.bin \
+  -f /dev/stdin
+```
+
+---
+
+### 🏁 Success Criteria
+
+* No spurious “thank you” or “you” outputs during silence/noise.
+* Configurable suppression threshold.
+* Backward compatible: if `--lowconf-threshold` is unset or `0`, all output passes through unchanged.
+
+---
+
+would you like me to include a short code-context diff snippet (showing where to insert in the current whisper-stream main loop)?

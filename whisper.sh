@@ -73,6 +73,7 @@ WHISPER_FLAGS=(
   --stdin --stdin-format f32le
   --eos-config "$EOS_CONF"
   --step 1000 --length 4000 --keep 0
+  --lowconf-threshold 0.35
 )
 
 if [[ "$DEBUG_EOS" == "true" ]]; then
@@ -100,8 +101,9 @@ else
 fi
 
 ffmpeg -hide_banner -nostats "${FFDBG_OPTS[@]}" \
-  -f pulse -thread_queue_size 1024 -i "$SPEAKER_SRC" \
-  -f pulse -thread_queue_size 1024 -i "$MIC_SRC" \
+  -re -use_wallclock_as_timestamps 1 \
+  -f pulse -thread_queue_size 256 -i "$SPEAKER_SRC" \
+  -f pulse -thread_queue_size 256 -i "$MIC_SRC" \
   -filter_complex "[1:a]aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000, \
                       arnndn=m=$RNN:mix=0.90,highpass=f=80,lowpass=f=3400[mic]; \
                    [0:a]aformat=sample_fmts=flt:channel_layouts=mono,aresample=16000[speaker]; \
