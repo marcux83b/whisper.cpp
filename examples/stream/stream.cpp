@@ -619,7 +619,15 @@ int main(int argc, char ** argv) {
                                 has_detected_lang = true;
                                 prompt_tokens.clear();
                                 if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] switched decode language to %s\n", current_lang.c_str());
-                                skip_decode_once_after_switch = true;
+                                // Immediately flush current buffered chunk with the new language to avoid stalls
+                                if (!chunk.empty()) {
+                                    dbg("EOS: FLUSH (lang-switch)");
+                                    // ensure we do not skip this decode
+                                    // decode and reset chunk
+                                    decode_chunk(chunk);
+                                    chunk.clear(); S.frames_in_chunk = 0; preroll.clear();
+                                    S.st = eos_helpers::State::IDLE;
+                                }
                             } else {
                                 if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Keeping %s (p=%.2f)\n", current_lang.c_str(), prob_new);
                             }
