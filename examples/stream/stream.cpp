@@ -496,6 +496,7 @@ int main(int argc, char ** argv) {
                 printf("\n");
             }
 
+            int printed_segments = 0;
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i) {
                 const char * text = whisper_full_get_segment_text(ctx, i);
@@ -521,6 +522,7 @@ int main(int argc, char ** argv) {
                     if (params.fname_out.length() > 0) {
                         fout << text;
                     }
+                    ++printed_segments;
                 } else {
                     const int64_t t0s = whisper_full_get_segment_t0(ctx, i);
                     const int64_t t1s = whisper_full_get_segment_t1(ctx, i);
@@ -531,10 +533,72 @@ int main(int argc, char ** argv) {
                     if (params.fname_out.length() > 0) {
                         fout << output;
                     }
+                    ++printed_segments;
                 }
             }
             if (params.fname_out.length() > 0) {
                 fout << std::endl;
+            }
+            // Fallback: if nothing printed and auto-lang is enabled, detect on this buffer and re-decode once
+            if (printed_segments == 0 && auto_lang_enabled) {
+                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] no output from decode; probing language on current chunk...\n");
+                // fresh detection state
+                if (lang_state) whisper_free_state(lang_state);
+                lang_state = whisper_init_state(ctx);
+                std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
+                if (whisper_pcm_to_mel_with_state(ctx, lang_state, buf.data(), (int)buf.size(), params.n_threads) == 0) {
+                    int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
+                    if (lang_new_id >= 0) {
+                        float prob_new = lang_probs[lang_new_id];
+                        const char* lang_new = whisper_lang_str(lang_new_id);
+                        if (prob_new >= std::max(0.6f, params.auto_lang_threshold - 0.1f) && std::string(lang_new) != current_lang) {
+                            if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Forcing switch on no-output: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
+                            current_lang = lang_new;
+                            prompt_tokens.clear();
+                            // re-run decode once with new language
+                            whisper_full_params w2 = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
+                            w2.print_progress   = false;
+                            w2.print_special    = params.print_special;
+                            w2.print_realtime   = false;
+                            w2.print_timestamps = !params.no_timestamps;
+                            w2.translate        = params.translate;
+                            w2.single_segment   = true;
+                            w2.max_tokens       = params.max_tokens;
+                            params.language = current_lang;
+                            w2.language         = params.language.c_str();
+                            w2.n_threads        = params.n_threads;
+                            w2.beam_search.beam_size = params.beam_size;
+                            w2.audio_ctx        = params.audio_ctx;
+                            w2.tdrz_enable      = params.tinydiarize;
+                            w2.temperature_inc  = params.no_fallback ? 0.0f : w2.temperature_inc;
+                            w2.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
+                            w2.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
+                            if (whisper_full(ctx, w2, buf.data(), buf.size()) == 0) {
+                                int n2 = whisper_full_n_segments(ctx);
+                                for (int i = 0; i < n2; ++i) {
+                                    const char * text = whisper_full_get_segment_text(ctx, i);
+                                    if (params.no_timestamps) {
+                                        printf("%s", text);
+                                        fflush(stdout);
+                                        if (params.fname_out.length() > 0) {
+                                            fout << text;
+                                        }
+                                    } else {
+                                        const int64_t t0s = whisper_full_get_segment_t0(ctx, i);
+                                        const int64_t t1s = whisper_full_get_segment_t1(ctx, i);
+                                        std::string output = "[" + to_timestamp(t0s, false) + " --> " + to_timestamp(t1s, false) + "]  " + text + "\n";
+                                        printf("%s", output.c_str());
+                                        fflush(stdout);
+                                        if (params.fname_out.length() > 0) {
+                                            fout << output;
+                                        }
+                                    }
+                                }
+                                if (params.fname_out.length() > 0) fout << std::endl;
+                            }
+                        }
+                    }
+                }
             }
             ++n_iter_eos;
 
