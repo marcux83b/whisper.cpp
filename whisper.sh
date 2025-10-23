@@ -16,6 +16,7 @@
 # - BUFFER_SEC=1.0     # seconds of end padding via sox (default 1.0)
 # - MBUFFER_MEM=2G     # mbuffer memory target (e.g., 2G, 5G)
 # - MBUFFER_BLOCK=64k  # mbuffer block size
+# - MBUFFER_QUIET=1    # pass -q to mbuffer to suppress progress output (default 1)
 #
 ## Usage
 #  ./whisper.sh -o ./whisper_output.txt
@@ -35,11 +36,17 @@ RNN="$HOME/rnnoise-models/std.rnnn"   # try std.rnnn if cb feels too aggressive
 
 # env toggle: DEBUG_EOS=true ./whisper.sh
 DEBUG_EOS="${DEBUG_EOS:-false}"
+# auto-language debug and smoothing toggles
+QUIET_INIT_LOGS="${QUIET_INIT_LOGS:-1}"          # default quiet
+DEBUG_AUTO_LANG_TOPK="${DEBUG_AUTO_LANG_TOPK:-1}" # default show topK
+AUTO_LANG_USE_EWMA="${AUTO_LANG_USE_EWMA:-0}"
+AUTO_LANG_EWMA_ALPHA="${AUTO_LANG_EWMA_ALPHA:-0.5}"
 
 # buffer / mbuffer configuration
 BUFFER_SEC="${BUFFER_SEC:-1.0}"
 MBUFFER_MEM="${MBUFFER_MEM:-2G}"
 MBUFFER_BLOCK="${MBUFFER_BLOCK:-64k}"
+MBUFFER_QUIET="${MBUFFER_QUIET:-1}"
 
 # === REQUIRED ARGS ===
 OUT_FILE=""
@@ -86,6 +93,20 @@ if [[ "$DEBUG_EOS" == "true" ]]; then
   WHISPER_FLAGS+=(--debug-eos)
 fi
 
+# Optional observability / behavior flags
+if [[ "$QUIET_INIT_LOGS" = "1" ]]; then
+  WHISPER_FLAGS+=(--quiet-init-logs)
+fi
+if [[ "$DEBUG_AUTO_LANG_TOPK" = "1" ]]; then
+  WHISPER_FLAGS+=(--debug-auto-lang-topk)
+fi
+if [[ -n "$AUTO_LANG_EWMA_ALPHA" ]]; then
+  WHISPER_FLAGS+=(--auto-lang-ewma-alpha "$AUTO_LANG_EWMA_ALPHA")
+fi
+if [[ "$AUTO_LANG_USE_EWMA" = "1" ]]; then
+  WHISPER_FLAGS+=(--auto-lang-use-ewma)
+fi
+
 # === PIPELINE (RNNoise tuned mix & sync buffers) ===
 
 # Optional diagnostics:
@@ -94,10 +115,11 @@ fi
 MONITOR="${MONITOR:-0}"
 FFMPEG_DEBUG="${FFMPEG_DEBUG:-0}"
 
+# Monitoring: prefer mbuffer built-in progress; pv is no longer used in the pipeline
 if [[ "$MONITOR" = "1" ]]; then
-  PIPE_CMD="pv -rab"
+  MB_PROGRESS_OPTS=( -P 5 )
 else
-  PIPE_CMD="cat"
+  MB_PROGRESS_OPTS=()
 fi
 
 if [[ "$FFMPEG_DEBUG" = "1" ]]; then
@@ -118,5 +140,5 @@ ffmpeg -hide_banner -nostats "${FFDBG_OPTS[@]}" \
                        volume=1.9,aresample=resampler=soxr:async=0:first_pts=0,asetpts=N/SR/TB" \
   -ac 1 -ar 16000 -f f32le - \
 | sox -t f32 -r 16000 -c 1 - -t f32 -r 16000 -c 1 - pad 0 "${BUFFER_SEC}" \
-| mbuffer -m "${MBUFFER_MEM}" -s "${MBUFFER_BLOCK}" -o - \
+| mbuffer ${MB_PROGRESS_OPTS[@]:-} $([[ "$MBUFFER_QUIET" = "1" && "$MONITOR" != "1" ]] && echo -n "-q") -m "${MBUFFER_MEM}" -s "${MBUFFER_BLOCK}" -o - \
 | ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" >> "$OUT_FILE"

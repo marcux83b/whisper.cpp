@@ -19,6 +19,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <map>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -64,6 +65,12 @@ struct whisper_params {
     std::string auto_lang_fallback = "en";      // fallback before first detection
     bool       debug_auto_lang     = false;      // verbose logs for auto-lang
     float      auto_lang_window_sec = 3.0f;      // seconds of most-recent audio used for detection
+
+    bool       debug_auto_lang_topk = false;     // print top-k language probabilities
+    bool       quiet_init_logs      = false;     // suppress noisy init logs
+    // EWMA smoothing for language probabilities (for observability or gating)
+    float      auto_lang_ewma_alpha = 0.5f;      // 0..1, higher = faster response
+    bool       auto_lang_use_ewma   = false;     // if true, base switch on EWMA instead of instant
 };
 
 // end-of-speech (EOS) detection parameters for stdin streaming
@@ -166,6 +173,10 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--eos-min-chunk-ms")  { eos.min_chunk_ms  = std::stoi(argv[++i]); }
         else if (                  arg == "--debug-eos")      { eos.debug           = true; }
         else if (                  arg == "--debug-auto-lang")   { params.debug_auto_lang = true; }
+        else if (                  arg == "--debug-auto-lang-topk") { params.debug_auto_lang_topk = true; }
+        else if (                  arg == "--quiet-init-logs")   { params.quiet_init_logs = true; }
+        else if (                  arg == "--auto-lang-ewma-alpha") { params.auto_lang_ewma_alpha = std::stof(argv[++i]); }
+        else if (                  arg == "--auto-lang-use-ewma")   { params.auto_lang_use_ewma = true; }
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -213,6 +224,10 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "            --auto-lang-fallback L  [      en] Fallback language before first detection (with --language auto)\n");
     fprintf(stderr, "            --auto-lang-window-sec S[     3.0] Seconds of most-recent audio used for detection\n");
     fprintf(stderr, "            --debug-auto-lang       [   optional] Verbose auto-language detection logs\n");
+    fprintf(stderr, "            --debug-auto-lang-topk  [   optional] Print top-K language probabilities at re-eval\n");
+    fprintf(stderr, "            --quiet-init-logs       [   optional] Suppress noisy init logs from backend\n");
+    fprintf(stderr, "            --auto-lang-ewma-alpha F[    0.50] EWMA smoothing factor for language probs (0..1)\n");
+    fprintf(stderr, "            --auto-lang-use-ewma    [   optional] Use EWMA probs for switch decisions\n");
     fprintf(stderr, "            --eos-on F      [    0.0085] RMS to enter speech (stdin EOS)\n");
     fprintf(stderr, "            --eos-off F     [    0.0045] RMS to leave speech (stdin EOS)\n");
     fprintf(stderr, "            --eos-hang-ms N [        200] Hang time after last loud frame\n");
@@ -266,6 +281,26 @@ namespace eos_helpers {
     };
 }
 
+// ggml log filter to suppress noisy init unless requested
+static void log_filter_cb(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    const whisper_params * p = static_cast<const whisper_params *>(user_data);
+    if (!p || !p->quiet_init_logs) {
+        fputs(text, stderr);
+        fflush(stderr);
+        return;
+    }
+    // Drop known noisy init lines unless debug
+    if (strstr(text, "whisper_backend_init_gpu") ||
+        strstr(text, "whisper_init_state:")    ||
+        strstr(text, "whisper_model_load:")    ||
+        strstr(text, "ggml_vulkan:")) {
+        return;
+    }
+    fputs(text, stderr);
+    fflush(stderr);
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
@@ -275,6 +310,9 @@ int main(int argc, char ** argv) {
     if (whisper_params_parse(argc, argv, params, eos) == false) {
         return 1;
     }
+
+    // set log filter early to capture model/backend init messages
+    whisper_log_set(log_filter_cb, &params);
 
     // detect if stdout is a TTY (interactive console)
     bool stdout_is_tty = true;
@@ -334,6 +372,8 @@ int main(int argc, char ** argv) {
     std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
 
     std::vector<whisper_token> prompt_tokens;
+    // language EWMA store (size = n_langs)
+    std::vector<float> lang_ewma(whisper_lang_max_id() + 1, 0.0f);
 
     // print some info about the processing
     {
@@ -497,6 +537,7 @@ int main(int argc, char ** argv) {
             }
 
             int printed_segments = 0;
+            int skipped_lowconf = 0;
             const int n_segments = whisper_full_n_segments(ctx);
             for (int i = 0; i < n_segments; ++i) {
                 const char * text = whisper_full_get_segment_text(ctx, i);
@@ -512,7 +553,10 @@ int main(int argc, char ** argv) {
                         float avg_p = (float)(sum_p / token_count);
                         if (avg_p < params.low_conf_threshold) {
                             fprintf(stderr, "[debug] low conf %.2f -> skipped: '%s'\n", avg_p, text);
+                            skipped_lowconf++;
                             continue;
+                        } else if (params.debug_auto_lang) {
+                            fprintf(stderr, "[debug] avg_p %.2f -> printed: '%s'\n", avg_p, text);
                         }
                     }
                 }
@@ -538,6 +582,9 @@ int main(int argc, char ** argv) {
             }
             if (params.fname_out.length() > 0) {
                 fout << std::endl;
+            }
+            if (params.debug_auto_lang) {
+                fprintf(stderr, "[debug] decode summary: printed=%d, skipped_lowconf=%d, lang=%s\n", printed_segments, skipped_lowconf, current_lang.c_str());
             }
             // Fallback: if nothing printed and auto-lang is enabled, detect on this buffer and re-decode once
             if (printed_segments == 0 && auto_lang_enabled) {
@@ -642,13 +689,46 @@ int main(int argc, char ** argv) {
                         std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
                         if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, (int)win_samps, params.n_threads) == 0) {
                             int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
+                            // EWMA update
+                            float a = std::min(1.0f, std::max(0.0f, params.auto_lang_ewma_alpha));
+                            for (int i = 0; i <= whisper_lang_max_id(); ++i) {
+                                lang_ewma[i] = a*lang_probs[i] + (1.0f - a)*lang_ewma[i];
+                            }
                             if (lang_new_id >= 0) {
-                                float prob_new = lang_probs[lang_new_id];
-                                const char* lang_new = whisper_lang_str(lang_new_id);
-                                if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
-                                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Switch at EOS: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
+                                int ewma_best = std::max_element(lang_ewma.begin(), lang_ewma.end()) - lang_ewma.begin();
+                                float prob_inst = lang_probs[lang_new_id];
+                                float prob_ewma = lang_ewma[ewma_best];
+                                const char* lang_inst = whisper_lang_str(lang_new_id);
+                                const char* lang_ew = whisper_lang_str(ewma_best);
+                                if (params.debug_auto_lang_topk) {
+                                    std::vector<std::pair<float,int>> vpi, vpe;
+                                    vpi.reserve(whisper_lang_max_id()+1);
+                                    vpe.reserve(whisper_lang_max_id()+1);
+                                    for (int i = 0; i <= whisper_lang_max_id(); ++i) { vpi.emplace_back(lang_probs[i], i); vpe.emplace_back(lang_ewma[i], i); }
+                                    std::partial_sort(vpi.begin(), vpi.begin()+std::min<size_t>(5, vpi.size()), vpi.end(), [](auto &a, auto &b){return a.first>b.first;});
+                                    std::partial_sort(vpe.begin(), vpe.begin()+std::min<size_t>(5, vpe.size()), vpe.end(), [](auto &a, auto &b){return a.first>b.first;});
+                                    fprintf(stderr, "[auto-lang] topK inst:");
+                                    for (size_t k=0;k<std::min<size_t>(5, vpi.size());++k) fprintf(stderr, " %s=%.2f", whisper_lang_str(vpi[k].second), vpi[k].first);
+                                    fprintf(stderr, "\n[auto-lang] topK ewma:");
+                                    for (size_t k=0;k<std::min<size_t>(5, vpe.size());++k) fprintf(stderr, " %s=%.2f", whisper_lang_str(vpe[k].second), vpe[k].first);
+                                    fprintf(stderr, "\n");
+                                }
+                                bool do_switch = false;
+                                const char* lang_new = lang_inst;
+                                float prob_used = prob_inst;
+                                if (params.auto_lang_use_ewma) {
+                                    lang_new = lang_ew;
+                                    prob_used = prob_ewma;
+                                    do_switch = (prob_ewma >= params.auto_lang_threshold && std::string(lang_new) != current_lang);
+                                } else {
+                                    do_switch = (prob_inst >= params.auto_lang_threshold && std::string(lang_inst) != current_lang);
+                                }
+                                if (do_switch) {
+                                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Switch at EOS: %s -> %s (p=%.2f, inst=%.2f, ewma=%.2f)\n", current_lang.c_str(), lang_new, prob_used, prob_inst, prob_ewma);
                                     current_lang = lang_new;
                                     prompt_tokens.clear();
+                                } else if (params.debug_auto_lang) {
+                                    fprintf(stderr, "[auto-lang] Keeping %s (inst=%.2f, ewma=%.2f)\n", current_lang.c_str(), prob_inst, prob_ewma);
                                 }
                             }
                         }
@@ -903,10 +983,21 @@ int main(int argc, char ** argv) {
                         lang_state = whisper_init_state(ctx);
                         std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
                         if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
-                                int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
-                                if (lang_new_id >= 0) {
-                                    float prob_new = lang_probs[lang_new_id];
-                                    const char* lang_new = whisper_lang_str(lang_new_id);
+                            int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
+                            if (params.debug_auto_lang_topk) {
+                                std::vector<std::pair<float,int>> vp;
+                                vp.reserve(whisper_lang_max_id()+1);
+                                for (int i = 0; i <= whisper_lang_max_id(); ++i) vp.emplace_back(lang_probs[i], i);
+                                std::partial_sort(vp.begin(), vp.begin()+std::min<size_t>(5, vp.size()), vp.end(), [](auto &a, auto &b){return a.first>b.first;});
+                                fprintf(stderr, "[auto-lang] topK:");
+                                for (size_t k=0;k<std::min<size_t>(5, vp.size());++k) {
+                                    fprintf(stderr, " %s=%.2f", whisper_lang_str(vp[k].second), vp[k].first);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                            if (lang_new_id >= 0) {
+                                float prob_new = lang_probs[lang_new_id];
+                                const char* lang_new = whisper_lang_str(lang_new_id);
                                     if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
                                         if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Detected switch: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
                                         current_lang = lang_new;
