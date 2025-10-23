@@ -74,6 +74,11 @@ WHISPER_FLAGS=(
   --eos-config "$EOS_CONF"
   --step 1000 --length 4000 --keep 0
   --lowconf-threshold 0.35
+  --language auto
+  --auto-lang-reeval 5
+  --auto-lang-threshold 0.75
+  --auto-lang-fallback en
+  --debug-auto-lang
 )
 
 if [[ "$DEBUG_EOS" == "true" ]]; then

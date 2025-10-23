@@ -83,6 +83,31 @@ cat mic_test.raw | ./build/bin/whisper-stream \
 
 When filtering is active, skipped segments are logged to stderr with a `[debug] low conf` message.
 
+### Auto language re‑evaluation
+
+Automatically detect and switch language during streaming without restarting the process. Intended for
+`--language auto` use – falls back to a specified language until a confident detection occurs.
+
+Flags:
+
+- `--auto-lang-reeval <seconds>`: re‑evaluate language periodically (0 = off)
+- `--auto-lang-threshold <float>`: minimum probability to trigger switch (default 0.75)
+- `--auto-lang-fallback <string>`: fallback language (default `en`), used before first detection
+- `--debug-auto-lang`: verbose logs about re‑evaluation and decisions
+
+Example:
+
+```bash
+cat mixed.raw | ./build/bin/whisper-stream \
+  -m ./models/ggml-large-v3.bin \
+  --stdin --stdin-format f32le \
+  --language auto \
+  --auto-lang-reeval 5 \
+  --auto-lang-threshold 0.8 \
+  --auto-lang-fallback en \
+  --eos-config ./eos_defaults.conf
+```
+
 ### Loading EOS parameters from a config file
 
 You can load tuned EOS parameters from a simple key=value config file using `--eos-config`.
