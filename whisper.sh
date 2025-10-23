@@ -117,6 +117,6 @@ ffmpeg -hide_banner -nostats "${FFDBG_OPTS[@]}" \
                       highpass=f=120,lowpass=f=3500,compand=attacks=0.2:decays=0.4:points=-90/-900|-70/-70|-40/-20|0/0, \
                        volume=1.9,aresample=resampler=soxr:async=0:first_pts=0,asetpts=N/SR/TB" \
   -ac 1 -ar 16000 -f f32le - \
-| sox -t f32 - -t f32 - -- pad 0 "${BUFFER_SEC}" \
+| sox -t f32 -r 16000 -c 1 - -t f32 -r 16000 -c 1 - pad 0 "${BUFFER_SEC}" \
 | mbuffer -m "${MBUFFER_MEM}" -s "${MBUFFER_BLOCK}" -o - \
 | ./build/bin/whisper-stream "${WHISPER_FLAGS[@]}" >> "$OUT_FILE"

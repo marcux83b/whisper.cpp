@@ -627,6 +627,33 @@ int main(int argc, char ** argv) {
 
         auto flush_now = [&](){
             if ((int)chunk.size() >= MIN_FR * eos_helpers::FRAME_SAMPLES) {
+                // Auto-language detection on the EOS chunk before decode (stdin path only)
+                if (auto_lang_enabled) {
+                    size_t win_samps = (size_t) std::max(1.0f, params.auto_lang_window_sec) * 16000;
+                    if (win_samps > chunk.size()) win_samps = chunk.size();
+                    const float *win_ptr = chunk.data() + (chunk.size() - win_samps);
+                    // RMS gate
+                    double acc = 0.0; for (size_t qi = 0; qi < win_samps; ++qi) { double x = win_ptr[qi]; acc += x*x; }
+                    float rms_win = std::sqrt(acc / std::max<size_t>(1, win_samps));
+                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] EOS eval (win=%.1fs, rms=%.5f)\n", win_samps/16000.0, rms_win);
+                    if (rms_win >= 0.001f) {
+                        if (lang_state) whisper_free_state(lang_state);
+                        lang_state = whisper_init_state(ctx);
+                        std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
+                        if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, (int)win_samps, params.n_threads) == 0) {
+                            int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
+                            if (lang_new_id >= 0) {
+                                float prob_new = lang_probs[lang_new_id];
+                                const char* lang_new = whisper_lang_str(lang_new_id);
+                                if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
+                                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Switch at EOS: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
+                                    current_lang = lang_new;
+                                    prompt_tokens.clear();
+                                }
+                            }
+                        }
+                    }
+                }
                 dbg("EOS: FLUSH");
                 decode_chunk(chunk);
             } else {
@@ -656,53 +683,7 @@ int main(int argc, char ** argv) {
 
             // preroll always records
             preroll.push(fr.data(), eos_helpers::FRAME_SAMPLES);
-            if (auto_lang_enabled) {
-                push_recent(fr.data(), fr.size());
-                auto now = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_lang_eval).count() / 1000.0;
-                if (elapsed >= params.auto_lang_reeval && recent_pcm.size() >= (size_t)(16000 * 2)) { // need at least ~2s
-                    // Use only the most recent window from recent_pcm
-                    size_t win_samps = (size_t) std::max(1.0f, params.auto_lang_window_sec) * 16000;
-                    if (win_samps > recent_pcm.size()) win_samps = recent_pcm.size();
-                    const float *win_ptr = recent_pcm.data() + (recent_pcm.size() - win_samps);
-                    // RMS gate to avoid evaluating silence
-                    double acc = 0.0; for (size_t qi = 0; qi < win_samps; ++qi) { double x = win_ptr[qi]; acc += x*x; }
-                    float rms_win = std::sqrt(acc / std::max<size_t>(1, win_samps));
-                    if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] re-eval triggered after %.1fs (recent=%.1fs, win=%.1fs, rms=%.5f)\n", elapsed, recent_pcm.size()/16000.0, win_samps/16000.0, rms_win);
-                    if (rms_win < 0.001f) { last_lang_eval = now; continue; }
-                    // re-init detection state to avoid residual KV/cache bias across evaluations
-                    if (lang_state) whisper_free_state(lang_state);
-                    lang_state = whisper_init_state(ctx);
-                    std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
-                    // compute mel on separate state to avoid interfering with decode
-                    if (whisper_pcm_to_mel_with_state(ctx, lang_state, win_ptr, win_samps, params.n_threads) == 0) {
-                        int lang_new_id = whisper_lang_auto_detect_with_state(ctx, lang_state, 0, params.n_threads, lang_probs.data());
-                        if (lang_new_id >= 0) {
-                            float prob_new = lang_probs[lang_new_id];
-                            const char* lang_new = whisper_lang_str(lang_new_id);
-                            if (prob_new >= params.auto_lang_threshold && std::string(lang_new) != current_lang) {
-                                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Detected switch: %s -> %s (p=%.2f)\n", current_lang.c_str(), lang_new, prob_new);
-                                current_lang = lang_new;
-                                has_detected_lang = true;
-                                prompt_tokens.clear();
-                                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] switched decode language to %s\n", current_lang.c_str());
-                                // Immediately flush current buffered chunk with the new language to avoid stalls
-                                if (!chunk.empty()) {
-                                    dbg("EOS: FLUSH (lang-switch)");
-                                    // ensure we do not skip this decode
-                                    // decode and reset chunk
-                                    decode_chunk(chunk);
-                                    chunk.clear(); S.frames_in_chunk = 0; preroll.clear();
-                                    S.st = eos_helpers::State::IDLE;
-                                }
-                            } else {
-                                if (params.debug_auto_lang) fprintf(stderr, "[auto-lang] Keeping %s (p=%.2f)\n", current_lang.c_str(), prob_new);
-                            }
-                        }
-                    }
-                    last_lang_eval = now;
-                }
-            }
+            // In stdin mode, do not run auto-lang on raw frames; detection is performed at EOS flush
 
             switch (S.st) {
                 case eos_helpers::State::IDLE:
